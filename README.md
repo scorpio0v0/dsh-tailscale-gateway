@@ -12,38 +12,25 @@
 
 ## 安装
 
-前置:Windows、已安装并登录 [Tailscale](https://tailscale.com/)、DSH ≥ 0.2.x(web profile)。
+前置:Windows、已安装并登录 [Tailscale](https://tailscale.com/)、DSH ≥ 0.2.x(web profile)。本包声明了 `dsh.bundle`:**在 GUI 插件管理器里安装即自动完成配置**(插入插件行 + 重述 connection 行),卸载自动还原。
 
-### 方式 A:插件管理器(GitHub)
+### 方式 A:插件管理器(GitHub,推荐)
 
-GUI → 插件 → 安装插件,填入仓库地址:
+GUI → 插件 → 安装插件,填入:
 
 ```
 https://github.com/scorpio0v0/dsh-tailscale-gateway
 ```
 
-### 方式 B:本地源码
+### 方式 B:本地源码(手动)
 
 ```sh
 git clone https://github.com/scorpio0v0/dsh-tailscale-gateway.git
 ```
 
-在你的 profile patch(或 `--patch` 叠加层,见 `cordis.example.yml`)中加入:
+在 profile patch(`~/.dsh/profiles/web/cordis.patch.yml`)加入 `cordis.bundle.yml` 的两段内容,并把 insert 行的 `name` 换成插件源码绝对路径。
 
-```yaml
-- insert:
-    - id: tailscale-gateway
-      name: 'D:/absolute/path/to/dsh-tailscale-gateway/src/index.ts'
-      config:
-        listenPort: 3080
-- id: connection
-  inject: [ webStartup, tailscaleGateway ]
-  config:
-    trustedHosts: !!js "[...ctx.tailscaleGateway.trustedHosts, ...ctx.webStartup.trustedHosts]"
-    cookieMaxAgeDays: 3650
-```
-
-重启 DSH。启动日志出现 `[tailscale-gateway] forwarder <ip>:3080 -> 127.0.0.1:3080` 即成功。
+重启 DSH,启动日志出现 `[tailscale-gateway] forwarder <ip>:3080 -> 127.0.0.1:3080` 即成功。
 
 ## 使用
 
@@ -53,7 +40,7 @@ Cookie 默认 10 年(可在 patch 调整 `cookieMaxAgeDays`),登录一次长期�
 
 ## 卸载
 
-从 patch 删除上述两段,重启 DSH;转发器随插件卸载自动关闭。
+GUI 插件管理器中移除本插件即可:组合包 patch 自动回滚,转发器随插件卸载关闭。
 
 ## License
 

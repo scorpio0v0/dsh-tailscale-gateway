@@ -1,0 +1,13 @@
+# dsh-tailscale-gateway 组合包 patch:随插件安装自动应用,卸载自动移除。
+# 插入转发器插件行,并重述 connection 行(patch 会整体替换该行 config)以
+# 放行探测到的 Tailscale 权威、延长 Cookie 有效期。
+- insert:
+    - id: tailscale-gateway
+      name: 'dsh-tailscale-gateway'
+      config:
+        listenPort: 3080
+- id: connection
+  inject: [ webStartup, tailscaleGateway ]
+  config:
+    trustedHosts: !!js "[...ctx.tailscaleGateway.trustedHosts, ...ctx.webStartup.trustedHosts]"
+    cookieMaxAgeDays: 3650

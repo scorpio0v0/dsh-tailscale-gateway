@@ -1,7 +1,7 @@
 {
   "name": "dsh-tailscale-gateway",
-  "version": "0.1.0",
-  "description": "Expose the official DSH web GUI to your tailnet: auto-detects the local Tailscale IP, forwards a LAN port to the loopback-bound GUI, and provides trustedHosts for the connection row.",
+  "version": "0.1.1",
+  "description": "DSH plugin bundle: expose the official DSH web GUI to your tailnet (auto-detects the Tailscale IP, forwards a LAN port to the loopback-bound GUI, admits the phone Host authority).",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.ts",
@@ -20,5 +20,15 @@
   "homepage": "https://github.com/scorpio0v0/dsh-tailscale-gateway#readme",
   "files": [
     "src"
-  ]
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": [
+        "./cordis.bundle.yml"
+      ],
+      "platforms": [
+        "win32"
+      ]
+    }
+  }
 }
