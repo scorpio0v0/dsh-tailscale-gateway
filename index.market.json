@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "title": {
+    "en": "Community plugins",
+    "zh": "社区插件"
+  },
+  "metadata": {
+    "categories": {
+      "networking": {
+        "title": {
+          "en": "Networking",
+          "zh": "网络"
+        }
+      }
+    },
+    "labels": {},
+    "sortKeys": {}
+  },
+  "plugins": [
+    {
+      "name": "dsh-tailscale-gateway",
+      "title": {
+        "en": "Tailscale Gateway",
+        "zh": "Tailscale 局域网网关"
+      },
+      "description": {
+        "en": "Expose the official DSH web GUI to your tailnet: auto-detects the local Tailscale IP, forwards a LAN port to the loopback-bound GUI, and admits the phone Host authority.",
+        "zh": "把官方 DSH GUI 暴露到 Tailscale:自动探测本机 Tailscale IP 并在进程内转发,自动放行手机访问权威。"
+      },
+      "author": "scorpio0v0",
+      "homepage": "https://github.com/scorpio0v0/dsh-tailscale-gateway#readme",
+      "repository": {
+        "url": "https://github.com/scorpio0v0/dsh-tailscale-gateway"
+      },
+      "metadata": {
+        "category": "networking",
+        "keywords": [
+          "tailscale",
+          "gateway",
+          "remote-access"
+        ],
+        "labels": [],
+        "sortKeys": {}
+      },
+      "versions": [
+        {
+          "version": "0.1.0",
+          "publishTimestamp": 1794418518,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/scorpio0v0/dsh-tailscale-gateway",
+            "commit": "ad8c0270bfea6b2e17ce884a47c5194d5c74e0f8"
+          },
+          "engines": {}
+        }
+      ]
+    }
+  ]
+}

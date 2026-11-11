@@ -1,0 +1,24 @@
+{
+  "name": "dsh-tailscale-gateway",
+  "version": "0.1.0",
+  "description": "Expose the official DSH web GUI to your tailnet: auto-detects the local Tailscale IP, forwards a LAN port to the loopback-bound GUI, and provides trustedHosts for the connection row.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.ts",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "tailscale",
+    "gateway",
+    "remote-access"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scorpio0v0/dsh-tailscale-gateway.git"
+  },
+  "homepage": "https://github.com/scorpio0v0/dsh-tailscale-gateway#readme",
+  "files": [
+    "src"
+  ]
+}
