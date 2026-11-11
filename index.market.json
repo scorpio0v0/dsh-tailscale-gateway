@@ -44,12 +44,12 @@
       },
       "versions": [
         {
-          "version": "0.1.0",
-          "publishTimestamp": 1794418518,
+          "version": "0.1.1",
+          "publishTimestamp": 1794419472,
           "source": {
             "type": "git",
             "url": "https://github.com/scorpio0v0/dsh-tailscale-gateway",
-            "commit": "65d57d069227deb2e61b6f241eb5beda86ccde09"
+            "commit": "c7f7023a894797e860188e340d88526dcfecf86c"
           },
           "engines": {}
         }
