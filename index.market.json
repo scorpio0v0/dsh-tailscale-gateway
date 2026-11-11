@@ -49,7 +49,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/scorpio0v0/dsh-tailscale-gateway",
-            "commit": "ad8c0270bfea6b2e17ce884a47c5194d5c74e0f8"
+            "commit": "65d57d069227deb2e61b6f241eb5beda86ccde09"
           },
           "engines": {}
         }
