@@ -93,6 +93,12 @@ http://<电脑tailscale-ip>:3080/
 
 GUI 插件管理器中移除本插件即可:组合包 patch 自动回滚,转发器随插件卸载关闭。
 
+## 更新记录
+
+- **0.1.4** 修复 `cannot get property "connection" without inject` 导致的进程级崩溃:改用 Cordis 的 `ctx.get()` 读取服务(避免与 connection 行的 `inject: [tailscaleGateway]` 形成循环依赖),并把 socket 回调整体包进 `try/catch`,任何异常都降级为纯透传而不再杀掉 DSH。
+- **0.1.3** 引入透明认证(每请求注入有效 Cookie),手机无需令牌/Cookie。
+- **0.1.2** 组合包 patch 修复安装。
+
 ## License
 
 MIT

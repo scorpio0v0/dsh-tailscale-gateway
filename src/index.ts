@@ -122,19 +122,33 @@ async function detectDnsName(): Promise<string | null> {
  * Secure flag always match the running DSH version.
  * @returns the `name=value` pair, or null when Connection is not ready.
  */
+/** Minimal shape of the Connection service methods this plugin needs. */
+interface AuthConnection {
+  authenticatedUrl?: (baseUrl: string) => string
+  authorizeIndex?: (
+    request: { method?: string; url?: string; headers: Record<string, string> },
+    response: {
+      writeHead: (status: number, headers?: Readonly<Record<string, string>>) => unknown
+      end: (body?: string) => unknown
+    },
+  ) => boolean
+}
+
 function mintAuthCookie(ctx: Context, authority: string): string | null {
-  const connection = ctx.connection
-  if (typeof connection?.authenticatedUrl !== 'function'
-    || typeof connection?.authorizeIndex !== 'function') return null
-  let token: string | null
+  // Everything here is defensive: this runs inside a socket 'data' event, where
+  // an uncaught throw becomes a process-level fatal exception and kills DSH.
   try {
-    token = new URL(connection.authenticatedUrl(`http://${authority}/`)).searchParams.get('token')
-  } catch {
-    return null
-  }
-  if (token === null || token === '') return null
-  let setCookie: string | undefined
-  try {
+    // Cordis guards `ctx.<service>` reads with `inject`. The connection row
+    // injects `tailscaleGateway` (provided here), so declaring `connection` in
+    // our own `inject` would deadlock both fibers. `ctx.get()` is Cordis's
+    // reflection accessor that reads a service WITHOUT the inject requirement
+    // (DSH's own code uses `ctx.get('webServer')` the same way).
+    const connection = ctx.get('connection', false) as AuthConnection | undefined
+    if (typeof connection?.authenticatedUrl !== 'function'
+      || typeof connection?.authorizeIndex !== 'function') return null
+    const token = new URL(connection.authenticatedUrl(`http://${authority}/`)).searchParams.get('token')
+    if (token === null || token === '') return null
+    let setCookie: string | undefined
     connection.authorizeIndex(
       { method: 'GET', url: `/?token=${encodeURIComponent(token)}`, headers: { host: authority } },
       {
@@ -145,12 +159,12 @@ function mintAuthCookie(ctx: Context, authority: string): string | null {
         end(): void {},
       },
     )
+    if (setCookie === undefined) return null
+    const pair = setCookie.split(';', 1)[0]?.trim()
+    return pair !== undefined && pair.startsWith('dsh-auth-') ? pair : null
   } catch {
     return null
   }
-  if (setCookie === undefined) return null
-  const pair = setCookie.split(';', 1)[0]?.trim()
-  return pair !== undefined && pair.startsWith('dsh-auth-') ? pair : null
 }
 
 /**
@@ -239,35 +253,43 @@ export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): 
         }
 
         client.on('data', (chunk: Buffer) => {
-          if (decided) return
-          buffered = Buffer.concat([buffered, chunk])
-          const headerEnd = buffered.indexOf('\r\n\r\n')
-          if (headerEnd === -1) {
-            // Not HTTP, or an unusually large head: pass through untouched.
-            if (buffered.length > 65536) { decided = true; pipe(buffered) }
-            return
-          }
-          decided = true
-          if (!autoAuth) { pipe(buffered); return }
-          const headText = buffered.subarray(0, headerEnd).toString('latin1')
-          const hostLine = headText.split('\r\n').find(line => /^host\s*:/i.test(line))
-          const authority = hostLine === undefined ? '' : hostLine.slice(hostLine.indexOf(':') + 1).trim()
-          if (authority === '') { pipe(buffered); return }
-          let authCookie = cookieCache.get(authority) ?? null
-          if (authCookie === null) {
-            authCookie = mintAuthCookie(ctx, authority)
-            if (authCookie === null) {
-              // Connection is not ready yet (or this profile has none): stay a
-              // pure byte pipe so the plugin degrades instead of breaking DSH.
-              ctx.logger?.warn?.('[tailscale-gateway] connection unavailable; forwarding without transparent auth')
-              pipe(buffered)
+          // This is an EventEmitter callback: ANY uncaught throw here becomes a
+          // process-level fatal exception and kills the whole DSH host. Degrade
+          // to a pure byte pipe instead of ever letting that happen.
+          try {
+            if (decided) return
+            buffered = Buffer.concat([buffered, chunk])
+            const headerEnd = buffered.indexOf('\r\n\r\n')
+            if (headerEnd === -1) {
+              // Not HTTP, or an unusually large head: pass through untouched.
+              if (buffered.length > 65536) { decided = true; pipe(buffered) }
               return
             }
-            cookieCache.set(authority, authCookie)
-            ctx.logger?.warn?.('[tailscale-gateway] transparent auth ready for ' + authority)
+            decided = true
+            if (!autoAuth) { pipe(buffered); return }
+            const headText = buffered.subarray(0, headerEnd).toString('latin1')
+            const hostLine = headText.split('\r\n').find(line => /^host\s*:/i.test(line))
+            const authority = hostLine === undefined ? '' : hostLine.slice(hostLine.indexOf(':') + 1).trim()
+            if (authority === '') { pipe(buffered); return }
+            let authCookie = cookieCache.get(authority) ?? null
+            if (authCookie === null) {
+              authCookie = mintAuthCookie(ctx, authority)
+              if (authCookie === null) {
+                // Connection is not ready yet (or this profile has none): stay a
+                // pure byte pipe so the plugin degrades instead of breaking DSH.
+                ctx.logger?.warn?.('[tailscale-gateway] connection unavailable; forwarding without transparent auth')
+                pipe(buffered)
+                return
+              }
+              cookieCache.set(authority, authCookie)
+              ctx.logger?.warn?.('[tailscale-gateway] transparent auth ready for ' + authority)
+            }
+            const rest = buffered.subarray(headerEnd + 4)
+            pipe(Buffer.concat([Buffer.from(rewriteHead(headText, authCookie), 'latin1'), rest]))
+          } catch (error) {
+            ctx.logger?.warn?.('[tailscale-gateway] request handling failed: ' + String(error))
+            if (!decided) { decided = true; pipe(buffered) }
           }
-          const rest = buffered.subarray(headerEnd + 4)
-          pipe(Buffer.concat([Buffer.from(rewriteHead(headText, authCookie), 'latin1'), rest]))
         })
         client.on('close', wipe)
       })
