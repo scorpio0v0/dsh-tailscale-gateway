@@ -24,8 +24,8 @@
         "zh": "Tailscale 局域网网关"
       },
       "description": {
-        "en": "Expose the official DSH web GUI to your tailnet: auto-detects the local Tailscale IP, forwards a LAN port to the loopback-bound GUI, and admits the phone Host authority.",
-        "zh": "把官方 DSH GUI 暴露到 Tailscale:自动探测本机 Tailscale IP 并在进程内转发,自动放行手机访问权威。"
+        "en": "Expose the official DSH web GUI to your tailnet: auto-detects the Tailscale IP, forwards a LAN port to the loopback-bound GUI, and injects a valid auth cookie into every request so no launch token or browser cookie is needed.",
+        "zh": "把官方 DSH GUI 暴露到 Tailscale:自动探测本机 Tailscale IP 并在进程内转发,为每个请求注入有效认证 Cookie,手机无需令牌与浏览器 Cookie。"
       },
       "author": "scorpio0v0",
       "homepage": "https://github.com/scorpio0v0/dsh-tailscale-gateway#readme",
@@ -44,12 +44,12 @@
       },
       "versions": [
         {
-          "version": "0.1.2",
-          "publishTimestamp": 1794419747,
+          "version": "0.1.3",
+          "publishTimestamp": 1794755437,
           "source": {
             "type": "git",
             "url": "https://github.com/scorpio0v0/dsh-tailscale-gateway",
-            "commit": "44efc7f72850de9f9bddfd41bb8947a5be3680d0"
+            "commit": "68177cacfee2eed0176cdd29aca21ab439e87180"
           },
           "engines": {}
         }
