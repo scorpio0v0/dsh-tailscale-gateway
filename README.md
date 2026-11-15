@@ -95,6 +95,7 @@ GUI 插件管理器中移除本插件即可:组合包 patch 自动回滚,转发�
 
 ## 更新记录
 
+- **0.1.5** 通用透明认证:不再依赖 DSH 内部 `authorizeIndex` 的写法(跨版本会失效)。改为两条版本无关的路径:① 用启动令牌向本机 DSH 发真实 HTTP 请求,读取它自己签发的 `Set-Cookie`(格式完全由当前 DSH 版本决定,兼容 0.2.2-alpha/rc/stable);② 回退为从凭据服务读持久密钥直接签 v1 Cookie。修复在 DSH 0.2.2-rc.3 上透明认证失效导致的 401。
 - **0.1.4** 修复 `cannot get property "connection" without inject` 导致的进程级崩溃:改用 Cordis 的 `ctx.get()` 读取服务(避免与 connection 行的 `inject: [tailscaleGateway]` 形成循环依赖),并把 socket 回调整体包进 `try/catch`,任何异常都降级为纯透传而不再杀掉 DSH。
 - **0.1.3** 引入透明认证(每请求注入有效 Cookie),手机无需令牌/Cookie。
 - **0.1.2** 组合包 patch 修复安装。

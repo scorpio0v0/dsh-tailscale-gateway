@@ -24,11 +24,19 @@
  * URL later asks for authentication again".
  *
  * Rather than relying on the browser, the forwarder mints a valid browser
- * session cookie itself — through Connection's own public `authenticatedUrl()`
- * and `authorizeIndex()`, so the secret/signature/name/lifetime always match
- * the running DSH version — and injects it into EVERY forwarded request's
- * `Cookie` header. The phone therefore needs no token and no cookie at all:
- * `http://<tailscale-ip>:3080/` just works, on every visit, in any browser.
+ * session cookie itself and injects it into EVERY forwarded request's `Cookie`
+ * header, so the phone needs no token and no cookie at all. Two independent
+ * strategies are used, both version-agnostic:
+ *
+ *   A. Ask DSH itself to mint the cookie over its OWN HTTP surface: perform a
+ *      real `GET /?token=<launch-token>` against 127.0.0.1:<port> with the
+ *      target Host header, and read the `Set-Cookie` from the response. This
+ *      delegates cookie format/name/signature/lifetime entirely to the running
+ *      DSH build, so it works across versions (alpha/rc/stable) without any
+ *      knowledge of DSH internals. Requires Connection.authenticatedUrl().
+ *   B. Read the durable HMAC secret from the credentials service and sign the
+ *      well-known v1 cookie payload directly. Used when strategy A is not
+ *      available. The v1 format is stable across DSH versions.
  *
  * To guarantee that every request (including keep-alive reuse) is injected,
  * non-upgrade requests are rewritten to `Connection: close`, so each TCP
@@ -42,6 +50,8 @@
  * All DSH packages stay type-only: runtime access goes through ctx, so the
  * plugin loads from any directory via tsx.
  */
+import { createHash, createHmac } from 'node:crypto'
+import { request as httpRequest } from 'node:http'
 import { connect, createServer, type Server, type Socket } from 'node:net'
 import { execFile } from 'node:child_process'
 import type { Context } from '@deepseek-ai/cordis'
@@ -115,53 +125,95 @@ async function detectDnsName(): Promise<string | null> {
   }
 }
 
-/**
- * Ask Connection to mint exactly the browser-session cookie it would issue for
- * a token exchange on `authority`. Only public service methods are used, so
- * the secret, HMAC signature, cookie name, authority binding, lifetime and
- * Secure flag always match the running DSH version.
- * @returns the `name=value` pair, or null when Connection is not ready.
- */
-/** Minimal shape of the Connection service methods this plugin needs. */
-interface AuthConnection {
-  authenticatedUrl?: (baseUrl: string) => string
-  authorizeIndex?: (
-    request: { method?: string; url?: string; headers: Record<string, string> },
-    response: {
-      writeHead: (status: number, headers?: Readonly<Record<string, string>>) => unknown
-      end: (body?: string) => unknown
-    },
-  ) => boolean
+function encodeBase64Url(value: Uint8Array): string {
+  return Buffer.from(value).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/u, '')
 }
 
-function mintAuthCookie(ctx: Context, authority: string): string | null {
-  // Everything here is defensive: this runs inside a socket 'data' event, where
-  // an uncaught throw becomes a process-level fatal exception and kills DSH.
+function decodeBase64Url(value: string): Buffer | undefined {
+  if (!/^[A-Za-z0-9_-]*$/.test(value) || value.length % 4 === 1) return undefined
+  const padding = '='.repeat((4 - value.length % 4) % 4)
+  const decoded = Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/') + padding, 'base64')
+  return encodeBase64Url(decoded) === value ? decoded : undefined
+}
+
+/** Minimal Connection surface needed to obtain the fresh launch token. */
+interface AuthConnection {
+  authenticatedUrl?: (baseUrl: string) => string
+}
+
+/** Minimal Credentials surface needed to read the durable signing secret. */
+interface AuthCredentials {
+  readRecord?: (key: string) => Promise<{ kind?: string; payload?: { version?: number; secret?: string } } | undefined>
+}
+
+const AUTH_RECORD_KEY = 'client-connection/browser-session'
+
+/**
+ * Strategy A: let DSH mint the cookie over its own HTTP surface.
+ *
+ * A real `GET /?token=<launch-token>` is sent to the loopback listener with
+ * the target Host authority. DSH answers a 303 with a `Set-Cookie` in exactly
+ * the format the running build expects (name, signature, lifetime), which we
+ * capture verbatim. This avoids all dependence on internal response APIs such
+ * as `authorizeIndex`'s `writeHead` shape — the reason a v0.1.3/v0.1.4 plugin
+ * could fail on a different DSH version (e.g. 0.2.2-rc.3).
+ *
+ * @returns the `name=value` cookie pair, or null when unavailable.
+ */
+function mintViaHttp(ctx: Context, dshPort: number, launchToken: string, authority: string): Promise<string | null> {
+  return new Promise((resolveMint) => {
+    let settled = false
+    const finish = (value: string | null): void => {
+      if (settled) return
+      settled = true
+      resolveMint(value)
+    }
+    try {
+      const req = httpRequest({
+        host: '127.0.0.1',
+        port: dshPort,
+        method: 'GET',
+        path: '/?token=' + encodeURIComponent(launchToken),
+        headers: { host: authority, connection: 'close' },
+        timeout: 8000,
+      }, (resp) => {
+        // Drain the response so the socket is released, then read Set-Cookie.
+        resp.resume()
+        const raw = resp.headers['set-cookie']
+        const list = Array.isArray(raw) ? raw : raw === undefined ? [] : [raw]
+        const pair = list
+          .map((line) => line.split(';', 1)[0]?.trim() ?? '')
+          .find((line) => line.startsWith('dsh-auth-'))
+        finish(pair !== undefined && pair !== '' ? pair : null)
+      })
+      req.on('error', () => finish(null))
+      req.on('timeout', () => { req.destroy(); finish(null) })
+      req.end()
+    } catch {
+      finish(null)
+    }
+  })
+}
+
+/**
+ * Strategy B: sign the stable v1 browser cookie directly from the durable
+ * HMAC secret. Used when strategy A cannot obtain a token. The payload shape
+ * and HMAC scheme are fixed by DSH's browser-auth and have not changed.
+ */
+function mintDirect(secret: Buffer, authority: string): string | null {
   try {
-    // Cordis guards `ctx.<service>` reads with `inject`. The connection row
-    // injects `tailscaleGateway` (provided here), so declaring `connection` in
-    // our own `inject` would deadlock both fibers. `ctx.get()` is Cordis's
-    // reflection accessor that reads a service WITHOUT the inject requirement
-    // (DSH's own code uses `ctx.get('webServer')` the same way).
-    const connection = ctx.get('connection', false) as AuthConnection | undefined
-    if (typeof connection?.authenticatedUrl !== 'function'
-      || typeof connection?.authorizeIndex !== 'function') return null
-    const token = new URL(connection.authenticatedUrl(`http://${authority}/`)).searchParams.get('token')
-    if (token === null || token === '') return null
-    let setCookie: string | undefined
-    connection.authorizeIndex(
-      { method: 'GET', url: `/?token=${encodeURIComponent(token)}`, headers: { host: authority } },
-      {
-        writeHead(_status: number, headers?: Readonly<Record<string, string>>): void {
-          const raw = headers?.['set-cookie'] ?? headers?.['Set-Cookie']
-          if (typeof raw === 'string') setCookie = raw
-        },
-        end(): void {},
-      },
-    )
-    if (setCookie === undefined) return null
-    const pair = setCookie.split(';', 1)[0]?.trim()
-    return pair !== undefined && pair.startsWith('dsh-auth-') ? pair : null
+    const now = Date.now()
+    const payload = {
+      version: 1,
+      authority,
+      issuedAt: now,
+      expiresAt: now + 30 * 24 * 60 * 60 * 1000,
+    }
+    const body = encodeBase64Url(Buffer.from(JSON.stringify(payload), 'utf8'))
+    const signature = encodeBase64Url(createHmac('sha256', secret).update(body).digest())
+    const name = 'dsh-auth-' + encodeBase64Url(createHash('sha256').update(authority).digest())
+    return name + '=v1.' + body + '.' + signature
   } catch {
     return null
   }
@@ -185,9 +237,9 @@ function rewriteHead(head: string, authCookie: string): string {
     : previous.slice(previous.indexOf(':') + 1).split(';')
       .map(part => part.trim())
       .filter(part => part !== '' && !part.startsWith('dsh-auth-'))
-  kept.push(`Cookie: ${[...others, authCookie].join('; ')}`)
+  kept.push('Cookie: ' + [...others, authCookie].join('; '))
   kept.push(isUpgrade ? 'Connection: Upgrade' : 'Connection: close')
-  return `${requestLine}\r\n${kept.join('\r\n')}\r\n\r\n`
+  return requestLine + '\r\n' + kept.join('\r\n') + '\r\n\r\n'
 }
 
 export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): Promise<void> {
@@ -199,6 +251,49 @@ export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): 
   const autoStartService = config.autoStartService !== false
   const popup = config.popup !== false
   const autoAuth = config.autoAuth !== false
+
+  /**
+   * Resolved once at startup, retried briefly because Connection/Credentials
+   * are provided by other fibers that may activate slightly after this one.
+   * Both accessors use ctx.get() (Cordis reflection, no inject requirement):
+   * the connection row injects tailscaleGateway, so declaring connection here
+   * would create a circular fiber dependency and deadlock both plugins.
+   */
+  let launchToken: string | null = null
+  let signingSecret: Buffer | null = null
+  if (autoAuth) {
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        if (launchToken === null) {
+          const connection = ctx.get('connection', false) as AuthConnection | undefined
+          if (typeof connection?.authenticatedUrl === 'function') {
+            const token = new URL(connection.authenticatedUrl('http://127.0.0.1:' + String(dshPort) + '/'))
+              .searchParams.get('token')
+            if (token !== null && token !== '') launchToken = token
+          }
+        }
+        if (signingSecret === null) {
+          const credentials = ctx.get('credentials', false) as AuthCredentials | undefined
+          if (typeof credentials?.readRecord === 'function') {
+            const record = await credentials.readRecord(AUTH_RECORD_KEY)
+            const raw = record?.payload?.secret
+            if (typeof raw === 'string') {
+              const decoded = decodeBase64Url(raw)
+              if (decoded !== undefined && decoded.byteLength === 32) signingSecret = decoded
+            }
+          }
+        }
+      } catch {
+        // Service not ready yet; retry below.
+      }
+      if (launchToken !== null || signingSecret !== null) break
+      await new Promise(r => setTimeout(r, 250))
+    }
+    ctx.logger?.warn?.('[tailscale-gateway] auth strategy A (DSH HTTP mint): '
+      + (launchToken !== null ? 'ready' : 'unavailable')
+      + '; strategy B (direct v1 sign): ' + (signingSecret !== null ? 'ready' : 'unavailable'))
+  }
+
   /** authority -> valid `name=value` browser cookie, minted once per process. */
   const cookieCache = new Map<string, string>()
 
@@ -252,7 +347,7 @@ export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): 
           upstream.on('close', () => client.destroy())
         }
 
-        client.on('data', (chunk: Buffer) => {
+        client.on('data', async (chunk: Buffer) => {
           // This is an EventEmitter callback: ANY uncaught throw here becomes a
           // process-level fatal exception and kills the whole DSH host. Degrade
           // to a pure byte pipe instead of ever letting that happen.
@@ -273,11 +368,15 @@ export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): 
             if (authority === '') { pipe(buffered); return }
             let authCookie = cookieCache.get(authority) ?? null
             if (authCookie === null) {
-              authCookie = mintAuthCookie(ctx, authority)
+              authCookie = launchToken !== null
+                ? await mintViaHttp(ctx, dshPort, launchToken, authority)
+                : null
+              if (authCookie === null && signingSecret !== null) {
+                authCookie = mintDirect(signingSecret, authority)
+              }
               if (authCookie === null) {
-                // Connection is not ready yet (or this profile has none): stay a
-                // pure byte pipe so the plugin degrades instead of breaking DSH.
-                ctx.logger?.warn?.('[tailscale-gateway] connection unavailable; forwarding without transparent auth')
+                ctx.logger?.warn?.('[tailscale-gateway] cookie mint failed for ' + authority
+                  + '; forwarding without transparent auth')
                 pipe(buffered)
                 return
               }
