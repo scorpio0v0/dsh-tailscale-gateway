@@ -6,8 +6,11 @@
       name: 'dsh-tailscale-gateway'
       config:
         listenPort: 3080
+        # 每个请求自动注入有效 Cookie;设为 false 可恢复 DSH 自带的令牌+Cookie 认证
+        autoAuth: true
 - id: connection
   inject: [ webStartup, tailscaleGateway ]
   config:
     trustedHosts: !!js "[...ctx.tailscaleGateway.trustedHosts, ...ctx.webStartup.trustedHosts]"
-    cookieMaxAgeDays: 3650
+    # 浏览器普遍把 Cookie 寿命上限设为 400 天;10 年会被拒收/截断
+    cookieMaxAgeDays: 365

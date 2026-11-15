@@ -1,29 +1,52 @@
 /**
  * dsh-tailscale-gateway — expose the official DSH web GUI to your tailnet.
  *
- * Runs inside the DSH host process and does two things:
+ * Runs inside the DSH host process and does three things:
  *   1. Detects the local Tailscale IPv4 (`tailscale ip -4`); when Tailscale is
  *      down it tries to start the Windows service and (optionally) pops up a
  *      notice; it re-checks periodically and rebinds when the IP changes.
  *   2. Serves a plain TCP forwarder <tailscale-ip>:<listenPort> -> 127.0.0.1:<webServer.port>,
- *      so phones on the tailnet reach the loopback-bound official GUI.
+ *      so phones on the tailnet reach the loopback-bound official GUI. The
+ *      transport stays a raw byte pipe, so WebSocket/stream upgrades, SSE and
+ *      large uploads pass through untouched.
+ *   3. Provides the `tailscaleGateway` service with a `trustedHosts` array
+ *      ([detected-IP, MagicDNS-name]) so the connection row can admit the
+ *      phone's Host authority without any hardcoded addresses.
  *
- * It also provides the `tailscaleGateway` service with a `trustedHosts` array
- * ([detected-IP, MagicDNS-name]) so the connection row can admit the phone's
- * Host authority without any hardcoded addresses:
+ * ## Transparent authentication (the reason this plugin exists)
  *
- *   - id: connection
- *     inject: [webStartup, tailscaleGateway]
- *     config:
- *       trustedHosts: !!js "[...ctx.tailscaleGateway.trustedHosts, ...ctx.webStartup.trustedHosts]"
+ * The official GUI authenticates with a launch-token exchange on `/?token=`
+ * that answers a 303 carrying an HttpOnly; SameSite=Strict cookie bound to the
+ * exact `host:port` authority. Browsers are notoriously unreliable about
+ * keeping that cookie (Safari drops Set-Cookie on redirects, ITP evicts it,
+ * private mode never persists it, and mixing IP with MagicDNS name changes the
+ * cookie name). The result is: "the token URL works once, but opening the bare
+ * URL later asks for authentication again".
+ *
+ * Rather than relying on the browser, the forwarder mints a valid browser
+ * session cookie itself — through Connection's own public `authenticatedUrl()`
+ * and `authorizeIndex()`, so the secret/signature/name/lifetime always match
+ * the running DSH version — and injects it into EVERY forwarded request's
+ * `Cookie` header. The phone therefore needs no token and no cookie at all:
+ * `http://<tailscale-ip>:3080/` just works, on every visit, in any browser.
+ *
+ * To guarantee that every request (including keep-alive reuse) is injected,
+ * non-upgrade requests are rewritten to `Connection: close`, so each TCP
+ * connection carries exactly one HTTP request. Upgrade requests keep
+ * `Connection: Upgrade` so the WebSocket remote stream mux still works.
+ *
+ * Security: anyone who can reach the forwarder port is treated as the owner.
+ * The listener only binds the Tailscale interface, so this is limited to your
+ * tailnet. Set `autoAuth: false` to restore DSH's own token/cookie auth.
  *
  * All DSH packages stay type-only: runtime access goes through ctx, so the
  * plugin loads from any directory via tsx.
  */
-import { connect, createServer, type Server } from 'node:net'
+import { connect, createServer, type Server, type Socket } from 'node:net'
 import { execFile } from 'node:child_process'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
+import type {} from '@deepseek-ai/dsh-client-connection'
 
 export const name = 'tailscale-gateway'
 
@@ -41,6 +64,12 @@ export interface TailscaleGatewayConfig {
   readonly retryMs?: number
   /** Running re-check interval (ms). Default 30000. */
   readonly recheckMs?: number
+  /**
+   * Inject a valid owner cookie into every forwarded request so the phone
+   * needs no launch token and no browser cookie. Default true.
+   * Set false to keep DSH's own token + authority-bound cookie authentication.
+   */
+  readonly autoAuth?: boolean
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -86,6 +115,67 @@ async function detectDnsName(): Promise<string | null> {
   }
 }
 
+/**
+ * Ask Connection to mint exactly the browser-session cookie it would issue for
+ * a token exchange on `authority`. Only public service methods are used, so
+ * the secret, HMAC signature, cookie name, authority binding, lifetime and
+ * Secure flag always match the running DSH version.
+ * @returns the `name=value` pair, or null when Connection is not ready.
+ */
+function mintAuthCookie(ctx: Context, authority: string): string | null {
+  const connection = ctx.connection
+  if (typeof connection?.authenticatedUrl !== 'function'
+    || typeof connection?.authorizeIndex !== 'function') return null
+  let token: string | null
+  try {
+    token = new URL(connection.authenticatedUrl(`http://${authority}/`)).searchParams.get('token')
+  } catch {
+    return null
+  }
+  if (token === null || token === '') return null
+  let setCookie: string | undefined
+  try {
+    connection.authorizeIndex(
+      { method: 'GET', url: `/?token=${encodeURIComponent(token)}`, headers: { host: authority } },
+      {
+        writeHead(_status: number, headers?: Readonly<Record<string, string>>): void {
+          const raw = headers?.['set-cookie'] ?? headers?.['Set-Cookie']
+          if (typeof raw === 'string') setCookie = raw
+        },
+        end(): void {},
+      },
+    )
+  } catch {
+    return null
+  }
+  if (setCookie === undefined) return null
+  const pair = setCookie.split(';', 1)[0]?.trim()
+  return pair !== undefined && pair.startsWith('dsh-auth-') ? pair : null
+}
+
+/**
+ * Rewrite one HTTP request head: drop any stale `dsh-auth-` cookie, inject the
+ * freshly minted valid one, and force a single request per TCP connection so
+ * every request is authenticated (keep-alive reuse included). Upgrade requests
+ * keep `Connection: Upgrade` so the WebSocket remote stream mux survives.
+ */
+function rewriteHead(head: string, authCookie: string): string {
+  const lines = head.split('\r\n')
+  const requestLine = lines[0] ?? ''
+  const headers = lines.slice(1).filter(line => line !== '')
+  const isUpgrade = headers.some(line => /^upgrade\s*:/i.test(line))
+  const kept = headers.filter(line => !/^(cookie|connection|keep-alive|proxy-connection)\s*:/i.test(line))
+  const previous = headers.find(line => /^cookie\s*:/i.test(line))
+  const others = previous === undefined
+    ? []
+    : previous.slice(previous.indexOf(':') + 1).split(';')
+      .map(part => part.trim())
+      .filter(part => part !== '' && !part.startsWith('dsh-auth-'))
+  kept.push(`Cookie: ${[...others, authCookie].join('; ')}`)
+  kept.push(isUpgrade ? 'Connection: Upgrade' : 'Connection: close')
+  return `${requestLine}\r\n${kept.join('\r\n')}\r\n\r\n`
+}
+
 export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): Promise<void> {
   const webServer = ctx.webServer
   const dshPort = webServer?.port ?? 3080
@@ -94,6 +184,9 @@ export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): 
   const recheckMs = config.recheckMs ?? 30000
   const autoStartService = config.autoStartService !== false
   const popup = config.popup !== false
+  const autoAuth = config.autoAuth !== false
+  /** authority -> valid `name=value` browser cookie, minted once per process. */
+  const cookieCache = new Map<string, string>()
 
   const service: { trustedHosts: string[]; forwarderAddress: string | null; dnsName: string | null } = {
     trustedHosts: [], forwarderAddress: null, dnsName: null,
@@ -125,11 +218,58 @@ export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): 
   function bind(ip: string): Promise<boolean> {
     return new Promise((resolveBind) => {
       server = createServer((client) => {
-        const upstream = connect(dshPort, '127.0.0.1')
-        client.pipe(upstream); upstream.pipe(client)
-        const wipe = () => { client.destroy(); upstream.destroy() }
-        client.on('error', wipe); upstream.on('error', wipe)
-        client.on('close', () => upstream.destroy()); upstream.on('close', () => client.destroy())
+        let buffered = Buffer.alloc(0)
+        let decided = false
+        let upstream: Socket | null = null
+        const wipe = (): void => {
+          try { client.destroy() } catch { /* ignore */ }
+          if (upstream !== null) { try { upstream.destroy() } catch { /* ignore */ } }
+        }
+        client.on('error', wipe)
+
+        /** Forward the already-buffered bytes, then raw-pipe both directions. */
+        const pipe = (first: Buffer): void => {
+          upstream = connect(dshPort, '127.0.0.1')
+          upstream.on('error', wipe)
+          upstream.write(first)
+          client.pipe(upstream)
+          upstream.pipe(client)
+          client.on('close', () => { if (upstream !== null) upstream.destroy() })
+          upstream.on('close', () => client.destroy())
+        }
+
+        client.on('data', (chunk: Buffer) => {
+          if (decided) return
+          buffered = Buffer.concat([buffered, chunk])
+          const headerEnd = buffered.indexOf('\r\n\r\n')
+          if (headerEnd === -1) {
+            // Not HTTP, or an unusually large head: pass through untouched.
+            if (buffered.length > 65536) { decided = true; pipe(buffered) }
+            return
+          }
+          decided = true
+          if (!autoAuth) { pipe(buffered); return }
+          const headText = buffered.subarray(0, headerEnd).toString('latin1')
+          const hostLine = headText.split('\r\n').find(line => /^host\s*:/i.test(line))
+          const authority = hostLine === undefined ? '' : hostLine.slice(hostLine.indexOf(':') + 1).trim()
+          if (authority === '') { pipe(buffered); return }
+          let authCookie = cookieCache.get(authority) ?? null
+          if (authCookie === null) {
+            authCookie = mintAuthCookie(ctx, authority)
+            if (authCookie === null) {
+              // Connection is not ready yet (or this profile has none): stay a
+              // pure byte pipe so the plugin degrades instead of breaking DSH.
+              ctx.logger?.warn?.('[tailscale-gateway] connection unavailable; forwarding without transparent auth')
+              pipe(buffered)
+              return
+            }
+            cookieCache.set(authority, authCookie)
+            ctx.logger?.warn?.('[tailscale-gateway] transparent auth ready for ' + authority)
+          }
+          const rest = buffered.subarray(headerEnd + 4)
+          pipe(Buffer.concat([Buffer.from(rewriteHead(headText, authCookie), 'latin1'), rest]))
+        })
+        client.on('close', wipe)
       })
       server.on('error', (err: NodeJS.ErrnoException) => {
         if (err.code === 'EADDRINUSE') {
@@ -145,7 +285,8 @@ export async function apply(ctx: Context, config: TailscaleGatewayConfig = {}): 
       server.listen(listenPort, ip, () => {
         boundIp = ip
         service.forwarderAddress = ip + ':' + listenPort
-        ctx.logger?.warn?.('[tailscale-gateway] forwarder ' + ip + ':' + listenPort + ' -> 127.0.0.1:' + dshPort)
+        ctx.logger?.warn?.('[tailscale-gateway] forwarder ' + ip + ':' + listenPort + ' -> 127.0.0.1:' + dshPort
+          + (autoAuth ? ' (transparent auth on)' : ' (transparent auth off)'))
         resolveBind(true)
       })
     })

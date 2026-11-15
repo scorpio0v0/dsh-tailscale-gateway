@@ -1,7 +1,7 @@
 {
   "name": "dsh-tailscale-gateway",
-  "version": "0.1.2",
-  "description": "DSH plugin bundle: expose the official DSH web GUI to your tailnet (auto-detects the Tailscale IP, forwards a LAN port to the loopback-bound GUI, admits the phone Host authority).",
+  "version": "0.1.3",
+  "description": "DSH plugin bundle: expose the official DSH web GUI to your tailnet. Auto-detects the Tailscale IP, forwards a LAN port to the loopback-bound GUI, and injects a valid auth cookie into every request so no launch token or browser cookie is needed.",
   "license": "MIT",
   "type": "module",
   "main": "./src/index.ts",
